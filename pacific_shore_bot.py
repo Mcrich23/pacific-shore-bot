@@ -320,6 +320,10 @@ def save_state(path: str, state: dict[str, Any]) -> None:
             os.unlink(temp_path)
 
 
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
 def describe_unit(unit_id: str, details: dict[str, Any] | None) -> str:
     if not details:
         return unit_id
@@ -406,7 +410,9 @@ def post_discord(webhook_url: str, message: str, timeout_seconds: float) -> None
                     raise BotError(f"Discord webhook returned HTTP {response.status}")
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")[:500]
-            raise BotError(f"Discord webhook HTTP {exc.code}: {details}") from exc
+            retry_after = exc.headers.get("Retry-After")
+            retry_note = f" retry_after={retry_after}s" if retry_after else ""
+            raise BotError(f"Discord webhook HTTP {exc.code}:{retry_note} {details}") from exc
         except urllib.error.URLError as exc:
             raise BotError(f"Discord webhook failed: {exc.reason}") from exc
 
@@ -432,10 +438,70 @@ def split_discord_message(message: str) -> list[str]:
     return chunks
 
 
+def clear_pending_notification(entry: dict[str, Any]) -> None:
+    entry["needs_refire"] = False
+    entry.pop("pending_notification", None)
+
+
+def mark_pending_notification(entry: dict[str, Any], message: str, error: Exception) -> None:
+    existing = entry.get("pending_notification") or {}
+    entry["needs_refire"] = True
+    entry["pending_notification"] = {
+        "message": message,
+        "attempts": int(existing.get("attempts", 0)) + 1,
+        "created_at": existing.get("created_at") or utc_now(),
+        "last_attempt_at": utc_now(),
+        "last_error": str(error),
+    }
+
+
+def send_or_mark_pending(
+    config: Config,
+    state: dict[str, Any],
+    date_key: str,
+    entry: dict[str, Any],
+    message: str,
+) -> bool:
+    if not config.webhook_url:
+        return True
+
+    try:
+        post_discord(config.webhook_url, message, config.timeout_seconds)
+        clear_pending_notification(entry)
+        save_state(config.state_file, state)
+        return True
+    except Exception as exc:
+        mark_pending_notification(entry, message, exc)
+        save_state(config.state_file, state)
+        print(f"{date_key}: Discord notification pending ({exc})", flush=True)
+        return False
+
+
+def retry_pending_notification(
+    config: Config,
+    state: dict[str, Any],
+    date_key: str,
+    entry: dict[str, Any],
+) -> bool:
+    if not config.webhook_url or not entry.get("needs_refire"):
+        return False
+
+    pending = entry.get("pending_notification") or {}
+    message = pending.get("message")
+    if not message:
+        message = f"{date_key}: availability changed; retry requested but no saved message was present."
+
+    sent = send_or_mark_pending(config, state, date_key, entry, message)
+    if sent:
+        print(f"{date_key}: pending Discord notification sent", flush=True)
+    return sent
+
+
 def poll_once(config: Config, state: dict[str, Any]) -> int:
     saved_dates = state.setdefault("dates", {})
     changed_dates = 0
     first_run_dates = 0
+    refired_notifications = 0
     errors: list[str] = []
 
     for index, value in enumerate(date_range(config.start_date, config.end_date)):
@@ -457,19 +523,24 @@ def poll_once(config: Config, state: dict[str, Any]) -> int:
         is_first_seen = previous is None
         is_changed = previous is None or previous.get("hash") != snapshot["hash"]
         if is_changed:
-            saved_dates[date_key] = {
+            entry = {
                 **snapshot,
-                "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "checked_at": utc_now(),
+                "needs_refire": False,
             }
+            saved_dates[date_key] = entry
 
             if is_first_seen:
                 first_run_dates += 1
             if config.webhook_url and (config.notify_on_first_run or not is_first_seen):
                 message = summarize_change(date_key, previous, snapshot)
-                post_discord(config.webhook_url, message, config.timeout_seconds)
+                send_or_mark_pending(config, state, date_key, entry, message)
 
             if not is_first_seen:
                 changed_dates += 1
+        elif previous is not None and previous.get("needs_refire"):
+            if retry_pending_notification(config, state, date_key, previous):
+                refired_notifications += 1
 
         print(
             f"{date_key}: {'changed' if is_changed and not is_first_seen else 'baseline' if is_first_seen else 'unchanged'}",
@@ -482,6 +553,8 @@ def poll_once(config: Config, state: dict[str, Any]) -> int:
     save_state(config.state_file, state)
     if first_run_dates and not config.notify_on_first_run:
         print(f"Captured {first_run_dates} baseline date(s); first-run Discord notifications are disabled.")
+    if refired_notifications:
+        print(f"Refired {refired_notifications} pending Discord notification(s).")
     if errors:
         sample = "; ".join(errors[:5])
         extra = "" if len(errors) <= 5 else f"; plus {len(errors) - 5} more"

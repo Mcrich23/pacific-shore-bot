@@ -29,6 +29,8 @@ python3 pacific_shore_bot.py --once
 
 The first run saves `availability_state.json` and does not notify Discord unless `NOTIFY_ON_FIRST_RUN=true` or `--notify-on-first-run` is used.
 
+If Discord rate-limits or rejects a webhook notification, the date entry in `availability_state.json` is saved with `"needs_refire": true` and a `pending_notification` object. The next sweep retries that saved message even if availability has not changed again.
+
 ## Configuration
 
 All options can be set by environment variable or CLI flag.
