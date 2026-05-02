@@ -43,6 +43,7 @@ All options can be set by environment variable or CLI flag.
 | `REQUEST_DELAY_SECONDS` | `--request-delay-seconds` | `0.25` |
 | `TIMEOUT_SECONDS` | `--timeout-seconds` | `30` |
 | `REALPAGE_URL` | `--url` | the provided endpoint |
+| `REALPAGE_CLIENT_SESSION_ID` | `--client-session-id` | `auto` |
 | `REALPAGE_XYZ` | `--xyz-header` | the provided Safari `XYZ` header |
 | `REALPAGE_USER_AGENT` | `--user-agent` | the provided Safari user agent |
 | `NOTIFY_ON_FIRST_RUN` | `--notify-on-first-run` | `false` |
@@ -51,3 +52,7 @@ All options can be set by environment variable or CLI flag.
 `POLL_SECONDS` is the delay between full sweeps of all dates. `REQUEST_DELAY_SECONDS` is a small pause between individual date requests inside a sweep.
 
 If RealPage starts returning `401 Unauthorized`, grab a fresh Safari `curl` for the request and update `REALPAGE_URL` and `REALPAGE_XYZ`.
+
+Do not leave `REALPAGE_XYZ` set to a placeholder value in `.env`; if it is unset, the bot uses the captured default header baked into the script.
+
+`REALPAGE_CLIENT_SESSION_ID=auto` generates a fresh RealPage-style GUID when the bot starts.

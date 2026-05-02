@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -117,6 +118,7 @@ class Config:
     request_delay_seconds: float
     timeout_seconds: float
     state_file: str
+    client_session_id: str
     xyz_header: str | None
     user_agent: str
     notify_on_first_run: bool
@@ -146,10 +148,11 @@ def move_in_date(value: dt.date) -> str:
     return value.strftime("%m/%d/%Y")
 
 
-def build_url(base_url: str, value: dt.date) -> str:
+def build_url(base_url: str, value: dt.date, client_session_id: str) -> str:
     parsed = urllib.parse.urlparse(base_url)
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     query["MoveInDate"] = [move_in_date(value)]
+    query["ClientSessionID"] = [client_session_id]
     encoded_query = urllib.parse.urlencode(query, doseq=True)
     return urllib.parse.urlunparse(parsed._replace(query=encoded_query))
 
@@ -437,7 +440,7 @@ def poll_once(config: Config, state: dict[str, Any]) -> int:
 
     for index, value in enumerate(date_range(config.start_date, config.end_date)):
         date_key = value.isoformat()
-        url = build_url(config.url, value)
+        url = build_url(config.url, value, config.client_session_id)
         is_last = index == (config.end_date - config.start_date).days
         try:
             payload = fetch_json(url, config)
@@ -501,6 +504,11 @@ def build_config(argv: list[str]) -> Config:
     )
     parser.add_argument("--timeout-seconds", type=float, default=float(os.getenv("TIMEOUT_SECONDS", "30")))
     parser.add_argument("--state-file", default=os.getenv("STATE_FILE", DEFAULT_STATE_FILE))
+    parser.add_argument(
+        "--client-session-id",
+        default=os.getenv("REALPAGE_CLIENT_SESSION_ID", "auto"),
+        help="Use 'auto' to generate a fresh RealPage ClientSessionID at startup.",
+    )
     parser.add_argument("--xyz-header", default=os.getenv("REALPAGE_XYZ", DEFAULT_XYZ))
     parser.add_argument("--user-agent", default=os.getenv("REALPAGE_USER_AGENT", DEFAULT_USER_AGENT))
     parser.add_argument("--notify-on-first-run", action="store_true", default=env_bool("NOTIFY_ON_FIRST_RUN", False))
@@ -515,6 +523,10 @@ def build_config(argv: list[str]) -> Config:
     if args.timeout_seconds <= 0:
         raise ValueError("--timeout-seconds must be greater than zero")
 
+    client_session_id = args.client_session_id
+    if client_session_id.strip().lower() == "auto":
+        client_session_id = str(uuid.uuid4())
+
     return Config(
         url=args.url,
         webhook_url=args.webhook_url,
@@ -524,6 +536,7 @@ def build_config(argv: list[str]) -> Config:
         request_delay_seconds=args.request_delay_seconds,
         timeout_seconds=args.timeout_seconds,
         state_file=args.state_file,
+        client_session_id=client_session_id,
         xyz_header=args.xyz_header,
         user_agent=args.user_agent,
         notify_on_first_run=args.notify_on_first_run,
@@ -550,6 +563,7 @@ def main(argv: list[str]) -> int:
         f"every {config.poll_seconds:g}s; state={config.state_file}",
         flush=True,
     )
+    print(f"RealPage ClientSessionID={config.client_session_id}", flush=True)
 
     while not stop:
         started = time.monotonic()
