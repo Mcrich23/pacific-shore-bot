@@ -1,0 +1,14 @@
+services:
+  pacific-shore-bot:
+    build: .
+    container_name: pacific-shore-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STATE_FILE: /data/availability_state.json
+    volumes:
+      - pacific-shore-data:/data
+
+volumes:
+  pacific-shore-data:
