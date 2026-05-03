@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll RealPage apartment availability and notify Discord when units change."""
+"""Poll RealPage apartment availability and notify when units change."""
 
 from __future__ import annotations
 
@@ -47,6 +47,7 @@ DEFAULT_AUTH_REFRESH_URL = (
 DEFAULT_START_DATE = "2026-05-01"
 DEFAULT_END_DATE = "2026-09-30"
 DEFAULT_STATE_FILE = "availability_state.json"
+PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
 
 VOLATILE_KEYS = {
     "bpmsequence",
@@ -120,6 +121,14 @@ class AuthRefreshed(BotError):
 class Config:
     url: str
     webhook_url: str | None
+    pushover_app_token: str | None
+    pushover_user_key: str | None
+    pushover_device: str | None
+    pushover_priority: int
+    pushover_sound: str | None
+    pushover_title: str
+    pushover_url: str | None
+    pushover_url_title: str | None
     start_date: dt.date
     end_date: dt.date
     poll_seconds: float
@@ -639,8 +648,26 @@ def summarize_change(date_key: str, before: dict[str, Any] | None, after: dict[s
     return f"{date_key}: availability response changed; no unit-level records were detected."
 
 
+def notification_targets(config: Config) -> list[str]:
+    targets: list[str] = []
+    if config.pushover_app_token and config.pushover_user_key:
+        targets.append("pushover")
+    if config.webhook_url:
+        targets.append("discord")
+    return targets
+
+
+def notification_enabled(config: Config) -> bool:
+    return bool(notification_targets(config))
+
+
+def notifier_label(config: Config) -> str:
+    targets = notification_targets(config)
+    return "+".join(targets) if targets else "none"
+
+
 def post_discord(webhook_url: str, message: str, timeout_seconds: float) -> None:
-    chunks = split_discord_message(message)
+    chunks = split_message(message, 1900)
     for chunk in chunks:
         payload = json.dumps({"content": chunk}).encode("utf-8")
         request = urllib.request.Request(
@@ -665,8 +692,82 @@ def post_discord(webhook_url: str, message: str, timeout_seconds: float) -> None
             raise BotError(f"Discord webhook failed: {exc.reason}") from exc
 
 
-def split_discord_message(message: str) -> list[str]:
-    limit = 1900
+def post_pushover(config: Config, message: str) -> None:
+    if not config.pushover_app_token or not config.pushover_user_key:
+        raise BotError("Pushover is selected but PUSHOVER_APP_TOKEN or PUSHOVER_USER_KEY is missing")
+
+    chunks = split_message(message, 1024)
+    for index, chunk in enumerate(chunks, start=1):
+        title = config.pushover_title
+        if len(chunks) > 1:
+            title = f"{title} ({index}/{len(chunks)})"
+        data: dict[str, str] = {
+            "token": config.pushover_app_token,
+            "user": config.pushover_user_key,
+            "message": chunk,
+            "title": title[:250],
+            "priority": str(config.pushover_priority),
+        }
+        optional_values = {
+            "device": config.pushover_device,
+            "sound": config.pushover_sound,
+            "url": config.pushover_url,
+            "url_title": config.pushover_url_title,
+        }
+        for key, value in optional_values.items():
+            if value:
+                data[key] = value
+
+        payload = urllib.parse.urlencode(data).encode("utf-8")
+        request = urllib.request.Request(
+            PUSHOVER_API_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "pacific-shore-availability-bot/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")[:500]
+            reset = exc.headers.get("X-Limit-App-Reset")
+            reset_note = f" app_limit_reset={reset}" if reset else ""
+            raise BotError(f"Pushover HTTP {exc.code}:{reset_note} {details}") from exc
+        except urllib.error.URLError as exc:
+            raise BotError(f"Pushover failed: {exc.reason}") from exc
+
+        try:
+            result = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise BotError(f"Pushover response was not JSON: {body[:500]}") from exc
+        if result.get("status") != 1:
+            errors = result.get("errors") or [body[:500]]
+            raise BotError(f"Pushover rejected message: {'; '.join(str(error) for error in errors)}")
+
+
+def post_notification(config: Config, message: str) -> None:
+    targets = notification_targets(config)
+    if not targets:
+        return
+
+    errors: list[str] = []
+    for target in targets:
+        try:
+            if target == "pushover":
+                post_pushover(config, message)
+            elif target == "discord" and config.webhook_url:
+                post_discord(config.webhook_url, message, config.timeout_seconds)
+        except Exception as exc:
+            errors.append(f"{target}: {exc}")
+
+    if errors:
+        raise BotError("; ".join(errors))
+
+
+def split_message(message: str, limit: int) -> list[str]:
     if len(message) <= limit:
         return [message]
 
@@ -714,18 +815,18 @@ def send_or_mark_pending(
     entry: dict[str, Any],
     message: str,
 ) -> bool:
-    if not config.webhook_url:
+    if not notification_enabled(config):
         return True
 
     try:
-        post_discord(config.webhook_url, message, config.timeout_seconds)
+        post_notification(config, message)
         clear_pending_notification(entry)
         save_state(config.state_file, state)
         return True
     except Exception as exc:
         mark_pending_notification(entry, message, exc)
         save_state(config.state_file, state)
-        print(f"{date_key}: Discord notification pending ({exc})", flush=True)
+        print(f"{date_key}: notification pending ({exc})", flush=True)
         return False
 
 
@@ -735,7 +836,7 @@ def retry_pending_notification(
     date_key: str,
     entry: dict[str, Any],
 ) -> bool:
-    if not config.webhook_url or not entry.get("needs_refire"):
+    if not notification_enabled(config) or not entry.get("needs_refire"):
         return False
 
     pending = entry.get("pending_notification") or {}
@@ -745,7 +846,7 @@ def retry_pending_notification(
 
     sent = send_or_mark_pending(config, state, date_key, entry, message)
     if sent:
-        print(f"{date_key}: pending Discord notification sent", flush=True)
+        print(f"{date_key}: pending notification sent", flush=True)
     return sent
 
 
@@ -800,7 +901,7 @@ def poll_once(config: Config, state: dict[str, Any]) -> int:
 
             if is_first_seen:
                 first_run_dates += 1
-            if config.webhook_url and (config.notify_on_first_run or not is_first_seen):
+            if notification_enabled(config) and (config.notify_on_first_run or not is_first_seen):
                 message = summarize_change(date_key, previous, snapshot)
                 send_or_mark_pending(config, state, date_key, entry, message)
 
@@ -820,9 +921,9 @@ def poll_once(config: Config, state: dict[str, Any]) -> int:
 
     save_state(config.state_file, state)
     if first_run_dates and not config.notify_on_first_run:
-        print(f"Captured {first_run_dates} baseline date(s); first-run Discord notifications are disabled.")
+        print(f"Captured {first_run_dates} baseline date(s); first-run notifications are disabled.")
     if refired_notifications:
-        print(f"Refired {refired_notifications} pending Discord notification(s).")
+        print(f"Refired {refired_notifications} pending notification(s).")
     if stopped_for_auth:
         if config.auto_refresh_auth:
             refresh_realpage_auth(config, state)
@@ -842,9 +943,22 @@ def poll_once(config: Config, state: dict[str, Any]) -> int:
 
 
 def build_config(argv: list[str]) -> Config:
-    parser = argparse.ArgumentParser(description="Poll RealPage availability and notify Discord on changes.")
+    parser = argparse.ArgumentParser(description="Poll RealPage availability and notify on changes.")
     parser.add_argument("--url", default=os.getenv("REALPAGE_URL", DEFAULT_URL))
     parser.add_argument("--webhook-url", default=os.getenv("DISCORD_WEBHOOK_URL"))
+    parser.add_argument("--pushover-app-token", default=os.getenv("PUSHOVER_APP_TOKEN"))
+    parser.add_argument("--pushover-user-key", default=os.getenv("PUSHOVER_USER_KEY"))
+    parser.add_argument("--pushover-device", default=os.getenv("PUSHOVER_DEVICE"))
+    parser.add_argument(
+        "--pushover-priority",
+        type=int,
+        default=int(os.getenv("PUSHOVER_PRIORITY", "0")),
+        help="Pushover priority from -2 through 1. Emergency priority 2 is intentionally not used.",
+    )
+    parser.add_argument("--pushover-sound", default=os.getenv("PUSHOVER_SOUND"))
+    parser.add_argument("--pushover-title", default=os.getenv("PUSHOVER_TITLE", "Pacific Shores Availability"))
+    parser.add_argument("--pushover-url", default=os.getenv("PUSHOVER_URL"))
+    parser.add_argument("--pushover-url-title", default=os.getenv("PUSHOVER_URL_TITLE"))
     parser.add_argument("--start-date", default=os.getenv("START_DATE", DEFAULT_START_DATE))
     parser.add_argument("--end-date", default=os.getenv("END_DATE", DEFAULT_END_DATE))
     parser.add_argument("--poll-seconds", type=float, default=float(os.getenv("POLL_SECONDS", "300")))
@@ -896,6 +1010,10 @@ def build_config(argv: list[str]) -> Config:
         raise ValueError("--request-delay-seconds cannot be negative")
     if args.timeout_seconds <= 0:
         raise ValueError("--timeout-seconds must be greater than zero")
+    if args.pushover_priority < -2 or args.pushover_priority > 1:
+        raise ValueError("--pushover-priority must be between -2 and 1")
+    if bool(args.pushover_app_token) != bool(args.pushover_user_key):
+        raise ValueError("Pushover requires both PUSHOVER_APP_TOKEN and PUSHOVER_USER_KEY")
     if args.max_consecutive_401 < 0:
         raise ValueError("--max-consecutive-401 cannot be negative")
     if args.auth_refresh_timeout_seconds <= 0:
@@ -909,6 +1027,14 @@ def build_config(argv: list[str]) -> Config:
     return Config(
         url=args.url,
         webhook_url=args.webhook_url,
+        pushover_app_token=args.pushover_app_token,
+        pushover_user_key=args.pushover_user_key,
+        pushover_device=args.pushover_device,
+        pushover_priority=args.pushover_priority,
+        pushover_sound=args.pushover_sound,
+        pushover_title=args.pushover_title,
+        pushover_url=args.pushover_url,
+        pushover_url_title=args.pushover_url_title,
         start_date=parse_date(args.start_date),
         end_date=parse_date(args.end_date),
         poll_seconds=args.poll_seconds,
@@ -948,6 +1074,7 @@ def main(argv: list[str]) -> int:
         flush=True,
     )
     print(f"RealPage ClientSessionID={config.client_session_id}", flush=True)
+    print(f"Notifier={notifier_label(config)}", flush=True)
     if config.auto_refresh_auth:
         print(
             "RealPage auth auto-refresh enabled; "
@@ -968,11 +1095,11 @@ def main(argv: list[str]) -> int:
         except Exception as exc:
             message = f"Availability bot error: {exc}"
             print(message, file=sys.stderr, flush=True)
-            if config.webhook_url and config.alert_on_errors:
+            if notification_enabled(config) and config.alert_on_errors:
                 try:
-                    post_discord(config.webhook_url, message, config.timeout_seconds)
-                except Exception as webhook_exc:
-                    print(f"Could not post error to Discord: {webhook_exc}", file=sys.stderr, flush=True)
+                    post_notification(config, message)
+                except Exception as notification_exc:
+                    print(f"Could not post error notification: {notification_exc}", file=sys.stderr, flush=True)
 
         if config.once:
             break

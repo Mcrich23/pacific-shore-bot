@@ -1,13 +1,14 @@
 # Pacific Shore Availability Bot
 
-Polls the RealPage apartment availability endpoint for every move-in date from May 1, 2026 through September 30, 2026, saves the latest availability snapshot, and posts to a Discord webhook when available units change for a date.
+Polls the RealPage apartment availability endpoint for every move-in date from May 1, 2026 through September 30, 2026, saves the latest availability snapshot, and sends a Pushover or Discord notification when available units change for a date.
 
 The direct polling path uses the Python standard library. Automatic RealPage auth refresh uses Playwright with WebKit/Chromium, which are installed by the Docker image.
 
 ## Run
 
 ```bash
-export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+export PUSHOVER_APP_TOKEN="..."
+export PUSHOVER_USER_KEY="..."
 export POLL_SECONDS=60
 python3 pacific_shore_bot.py
 ```
@@ -28,9 +29,9 @@ For a one-time baseline/test sweep:
 python3 pacific_shore_bot.py --once
 ```
 
-The first run saves `availability_state.json` and does not notify Discord unless `NOTIFY_ON_FIRST_RUN=true` or `--notify-on-first-run` is used.
+The first run saves `availability_state.json` and does not notify unless `NOTIFY_ON_FIRST_RUN=true` or `--notify-on-first-run` is used.
 
-If Discord rate-limits or rejects a webhook notification, the date entry in `availability_state.json` is saved with `"needs_refire": true` and a `pending_notification` object. The next sweep retries that saved message even if availability has not changed again.
+If Pushover or Discord rejects a notification, the date entry in `availability_state.json` is saved with `"needs_refire": true` and a `pending_notification` object. The next sweep retries that saved message even if availability has not changed again.
 
 ## Configuration
 
@@ -39,6 +40,14 @@ All options can be set by environment variable or CLI flag.
 | Env var | CLI flag | Default |
 | --- | --- | --- |
 | `DISCORD_WEBHOOK_URL` | `--webhook-url` | unset |
+| `PUSHOVER_APP_TOKEN` | `--pushover-app-token` | unset |
+| `PUSHOVER_USER_KEY` | `--pushover-user-key` | unset |
+| `PUSHOVER_DEVICE` | `--pushover-device` | unset |
+| `PUSHOVER_PRIORITY` | `--pushover-priority` | `0` |
+| `PUSHOVER_SOUND` | `--pushover-sound` | unset |
+| `PUSHOVER_TITLE` | `--pushover-title` | `Pacific Shores Availability` |
+| `PUSHOVER_URL` | `--pushover-url` | unset |
+| `PUSHOVER_URL_TITLE` | `--pushover-url-title` | unset |
 | `POLL_SECONDS` | `--poll-seconds` | `300` |
 | `START_DATE` | `--start-date` | `2026-05-01` |
 | `END_DATE` | `--end-date` | `2026-09-30` |
@@ -59,6 +68,8 @@ All options can be set by environment variable or CLI flag.
 
 `POLL_SECONDS` is the delay between full sweeps of all dates. `REQUEST_DELAY_SECONDS` is a small pause between individual date requests inside a sweep.
 For every-minute polling, set `POLL_SECONDS=60` in `.env`. If a full sweep takes longer than 60 seconds, the next sweep starts immediately after the previous one finishes.
+
+Notifications are enabled by whichever credentials are present in the environment. Set `PUSHOVER_APP_TOKEN` and `PUSHOVER_USER_KEY` to send Pushover alerts, set `DISCORD_WEBHOOK_URL` to send Discord alerts, or set all three to send both. Pushover messages are split at 1024 characters; Discord messages are split at 1900 characters.
 
 If RealPage starts returning `401 Unauthorized`, the bot stops the sweep after `MAX_CONSECUTIVE_401` consecutive failures, launches a headless browser, visits `AUTH_REFRESH_URL`, captures a fresh RealPage AppService request with its `XYZ` header, saves that header and `ClientSessionID` under `realpage_auth` in the state file, and immediately starts a new sweep against the ApartmentList endpoint. With `AUTH_REFRESH_BROWSER=auto`, it tries WebKit first and Chromium second. If browser refresh cannot observe an `XYZ` header before `AUTH_REFRESH_TIMEOUT_SECONDS`, it fails cleanly instead of burning through every date; grab a fresh Safari `curl` for the request and update `REALPAGE_URL` and `REALPAGE_XYZ`.
 
