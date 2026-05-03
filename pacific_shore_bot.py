@@ -39,6 +39,10 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15"
 )
+DEFAULT_AUTH_REFRESH_URL = (
+    "https://www.pacificshoresapts.com/apartments/ca/santa-cruz/apply-now"
+    "?MoveInDate=06/01/2026#k=95150"
+)
 
 DEFAULT_START_DATE = "2026-05-01"
 DEFAULT_END_DATE = "2026-09-30"
@@ -108,6 +112,10 @@ class BotError(Exception):
     """Raised when polling or notification cannot complete cleanly."""
 
 
+class AuthRefreshed(BotError):
+    """Raised to restart a sweep after refreshing RealPage browser auth."""
+
+
 @dataclass(frozen=True)
 class Config:
     url: str
@@ -121,6 +129,11 @@ class Config:
     client_session_id: str
     xyz_header: str | None
     user_agent: str
+    max_consecutive_401: int
+    auto_refresh_auth: bool
+    auth_refresh_url: str
+    auth_refresh_browser: str
+    auth_refresh_timeout_seconds: float
     notify_on_first_run: bool
     alert_on_errors: bool
     once: bool
@@ -157,7 +170,17 @@ def build_url(base_url: str, value: dt.date, client_session_id: str) -> str:
     return urllib.parse.urlunparse(parsed._replace(query=encoded_query))
 
 
-def fetch_json(url: str, config: Config) -> Any:
+def active_auth(config: Config, state: dict[str, Any]) -> dict[str, str | None]:
+    auth = state.get("realpage_auth") if isinstance(state.get("realpage_auth"), dict) else {}
+    return {
+        "url": str(auth.get("url") or config.url),
+        "client_session_id": str(auth.get("client_session_id") or config.client_session_id),
+        "xyz_header": auth.get("xyz_header") or config.xyz_header,
+        "user_agent": str(auth.get("user_agent") or config.user_agent),
+    }
+
+
+def fetch_json(url: str, config: Config, xyz_header: str | None, user_agent: str) -> Any:
     headers = {
         "Pragma": "no-cache",
         "Accept": "application/json, text/plain, */*",
@@ -171,10 +194,10 @@ def fetch_json(url: str, config: Config) -> Any:
         "Priority": "u=3, i",
         "X-Phased": "",
         "X-AuthToken": "",
-        "User-Agent": config.user_agent,
+        "User-Agent": user_agent,
     }
-    if config.xyz_header:
-        headers["XYZ"] = config.xyz_header
+    if xyz_header:
+        headers["XYZ"] = xyz_header
 
     request = urllib.request.Request(
         url,
@@ -186,7 +209,13 @@ def fetch_json(url: str, config: Config) -> Any:
             charset = response.headers.get_content_charset() or "utf-8"
             body = response.read().decode(charset, errors="replace")
     except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")[:500]
+        error_body = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 400:
+            try:
+                return json.loads(error_body)
+            except json.JSONDecodeError:
+                pass
+        details = error_body[:500]
         raise BotError(f"HTTP {exc.code}: {details}") from exc
     except urllib.error.URLError as exc:
         raise BotError(f"request failed: {exc.reason}") from exc
@@ -324,6 +353,225 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+class RefreshTimeout(BotError):
+    """Raised when a browser auth refresh exceeds its total timeout."""
+
+
+def refresh_browser_order(value: str) -> list[str]:
+    browser = value.strip().lower()
+    if browser == "auto":
+        return ["webkit", "chromium"]
+    if browser in {"webkit", "chromium", "firefox"}:
+        return [browser]
+    raise ValueError("AUTH_REFRESH_BROWSER must be one of: auto, webkit, chromium, firefox")
+
+
+def capture_realpage_auth_with_browser(
+    playwright: Any,
+    browser_name: str,
+    config: Config,
+    state: dict[str, Any],
+    budget_seconds: float,
+) -> dict[str, Any] | None:
+    print(f"Refreshing RealPage auth with {browser_name} via {config.auth_refresh_url}", flush=True)
+    captured: dict[str, Any] = {}
+    deadline = time.monotonic() + budget_seconds
+
+    def capture_request(request: Any) -> None:
+        request_url = request.url
+        if "RP.Leasing.AppService.WebHost" not in request_url or request.method.upper() != "GET":
+            return
+        headers = request.headers
+        xyz = headers.get("xyz")
+        if not xyz:
+            return
+        if captured and "ApartmentList/v1" not in request_url:
+            return
+        captured["url"] = request_url
+        captured["headers"] = headers
+
+    def time_left() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def operation_timeout_ms(cap_seconds: float = 10.0) -> int:
+        return int(max(1.0, min(cap_seconds, time_left())) * 1000)
+
+    def wait_for_capture(page: Any, seconds: float) -> None:
+        wait_deadline = time.monotonic() + min(seconds, time_left())
+        while not captured and time.monotonic() < wait_deadline:
+            page.wait_for_timeout(250)
+
+    def probe_from_loaded_frames(page: Any) -> None:
+        auth = active_auth(config, state)
+        probe_url = build_url(str(auth["url"]), config.start_date, str(uuid.uuid4()))
+        script = """
+            async (url) => {
+                try {
+                    await fetch(url, {
+                        method: "GET",
+                        headers: {
+                            "Accept": "application/json, text/plain, */*"
+                        },
+                        cache: "no-store"
+                    });
+                } catch (error) {
+                    return String(error && error.message ? error.message : error);
+                }
+                return "ok";
+            }
+        """
+
+        for frame in page.frames:
+            if captured or time_left() <= 1:
+                return
+            try:
+                frame.evaluate(script, probe_url, timeout=operation_timeout_ms(3))
+                wait_for_capture(page, 2)
+            except Exception:
+                continue
+
+    browser = None
+    try:
+        browser_type = getattr(playwright, browser_name)
+        launch_kwargs: dict[str, Any] = {"headless": True}
+        if browser_name == "chromium":
+            launch_kwargs["args"] = [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ]
+        browser = browser_type.launch(**launch_kwargs)
+        context = browser.new_context(
+            user_agent=config.user_agent,
+            locale="en-US",
+            timezone_id="America/Los_Angeles",
+            viewport={"width": 1440, "height": 1000},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """
+        )
+        context.on("request", capture_request)
+        page = context.new_page()
+        page.set_default_timeout(operation_timeout_ms())
+        try:
+            page.goto(
+                config.auth_refresh_url,
+                wait_until="domcontentloaded",
+                timeout=operation_timeout_ms(15),
+            )
+            try:
+                page.wait_for_load_state("networkidle", timeout=operation_timeout_ms(10))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        wait_for_capture(page, 10)
+        if not captured:
+            probe_from_loaded_frames(page)
+        if not captured and time_left() > 1:
+            try:
+                page.goto(
+                    "https://leasing.realpage.com/oll/",
+                    wait_until="domcontentloaded",
+                    timeout=operation_timeout_ms(10),
+                )
+            except Exception:
+                pass
+            wait_for_capture(page, 2)
+            probe_from_loaded_frames(page)
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    return captured or None
+
+
+def refresh_realpage_auth(config: Config, state: dict[str, Any]) -> None:
+    if not config.auto_refresh_auth:
+        raise BotError("RealPage auth auto-refresh is disabled.")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise BotError(
+            "Playwright is not installed, so RealPage auth cannot refresh automatically. "
+            "Rebuild the Docker image or run `pip install -r requirements.txt && playwright install chromium webkit`."
+        ) from exc
+
+    captured: dict[str, Any] | None = None
+    errors: list[str] = []
+    browsers = refresh_browser_order(config.auth_refresh_browser)
+    per_browser_budget = max(12.0, config.auth_refresh_timeout_seconds / len(browsers))
+
+    def handle_refresh_timeout(_signum: int, _frame: Any) -> None:
+        raise RefreshTimeout(
+            f"RealPage auth browser refresh exceeded {config.auth_refresh_timeout_seconds:g}s."
+        )
+
+    old_alarm_handler = None
+    try:
+        if hasattr(signal, "SIGALRM"):
+            old_alarm_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, handle_refresh_timeout)
+            signal.setitimer(signal.ITIMER_REAL, config.auth_refresh_timeout_seconds)
+
+        with sync_playwright() as playwright:
+            for browser_name in browsers:
+                try:
+                    captured = capture_realpage_auth_with_browser(
+                        playwright,
+                        browser_name,
+                        config,
+                        state,
+                        per_browser_budget,
+                    )
+                    if captured:
+                        break
+                    errors.append(f"{browser_name}: no RealPage AppService request included an XYZ header")
+                except RefreshTimeout:
+                    raise
+                except Exception as exc:
+                    errors.append(f"{browser_name}: {exc}")
+    finally:
+        if hasattr(signal, "SIGALRM"):
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            if old_alarm_handler is not None:
+                signal.signal(signal.SIGALRM, old_alarm_handler)
+
+    if not captured:
+        detail = "; ".join(errors) if errors else "no browser attempts ran"
+        raise BotError(
+            "RealPage auth browser refresh did not observe a RealPage AppService request with an XYZ header. "
+            f"Tried {', '.join(browsers)}. {detail}"
+        )
+
+    request_url = str(captured["url"])
+    headers = captured["headers"]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(request_url).query)
+    client_session_id = (query.get("ClientSessionID") or [str(uuid.uuid4())])[0]
+    state["realpage_auth"] = {
+        "url": request_url if "ApartmentList/v1" in request_url else config.url,
+        "client_session_id": client_session_id,
+        "xyz_header": headers["xyz"],
+        "user_agent": headers.get("user-agent") or config.user_agent,
+        "refreshed_at": utc_now(),
+        "source_page": config.auth_refresh_url,
+    }
+    save_state(config.state_file, state)
+    print(f"Refreshed RealPage auth; ClientSessionID={client_session_id}", flush=True)
+
+
 def describe_unit(unit_id: str, details: dict[str, Any] | None) -> str:
     if not details:
         return unit_id
@@ -438,6 +686,10 @@ def split_discord_message(message: str) -> list[str]:
     return chunks
 
 
+def is_auth_failure(error: Exception) -> bool:
+    return "HTTP 401" in str(error)
+
+
 def clear_pending_notification(entry: dict[str, Any]) -> None:
     entry["needs_refire"] = False
     entry.pop("pending_notification", None)
@@ -503,20 +755,36 @@ def poll_once(config: Config, state: dict[str, Any]) -> int:
     first_run_dates = 0
     refired_notifications = 0
     errors: list[str] = []
+    consecutive_401s = 0
+    stopped_for_auth = False
 
     for index, value in enumerate(date_range(config.start_date, config.end_date)):
         date_key = value.isoformat()
-        url = build_url(config.url, value, config.client_session_id)
+        auth = active_auth(config, state)
+        url = build_url(str(auth["url"]), value, str(auth["client_session_id"]))
         is_last = index == (config.end_date - config.start_date).days
         try:
-            payload = fetch_json(url, config)
+            payload = fetch_json(url, config, auth["xyz_header"], str(auth["user_agent"]))
             snapshot = normalize_availability(payload)
         except Exception as exc:
             errors.append(f"{date_key}: {exc}")
+            if is_auth_failure(exc):
+                consecutive_401s += 1
+            else:
+                consecutive_401s = 0
             print(f"{date_key}: failed ({exc})", flush=True)
+            if config.max_consecutive_401 > 0 and consecutive_401s >= config.max_consecutive_401:
+                stopped_for_auth = True
+                print(
+                    f"Stopping sweep after {consecutive_401s} consecutive HTTP 401 responses.",
+                    flush=True,
+                )
+                break
             if not is_last and config.request_delay_seconds > 0:
                 time.sleep(config.request_delay_seconds)
             continue
+
+        consecutive_401s = 0
 
         previous = saved_dates.get(date_key)
 
@@ -555,6 +823,17 @@ def poll_once(config: Config, state: dict[str, Any]) -> int:
         print(f"Captured {first_run_dates} baseline date(s); first-run Discord notifications are disabled.")
     if refired_notifications:
         print(f"Refired {refired_notifications} pending Discord notification(s).")
+    if stopped_for_auth:
+        if config.auto_refresh_auth:
+            refresh_realpage_auth(config, state)
+            raise AuthRefreshed(
+                f"RealPage auth refreshed after {consecutive_401s} consecutive HTTP 401 responses."
+            )
+        raise BotError(
+            f"RealPage returned {consecutive_401s} consecutive HTTP 401 responses. "
+            "Refresh REALPAGE_XYZ from a new Safari curl, enable AUTO_REFRESH_AUTH, "
+            "or remove a bad placeholder value from .env."
+        )
     if errors:
         sample = "; ".join(errors[:5])
         extra = "" if len(errors) <= 5 else f"; plus {len(errors) - 5} more"
@@ -584,6 +863,28 @@ def build_config(argv: list[str]) -> Config:
     )
     parser.add_argument("--xyz-header", default=os.getenv("REALPAGE_XYZ", DEFAULT_XYZ))
     parser.add_argument("--user-agent", default=os.getenv("REALPAGE_USER_AGENT", DEFAULT_USER_AGENT))
+    parser.add_argument(
+        "--max-consecutive-401",
+        type=int,
+        default=int(os.getenv("MAX_CONSECUTIVE_401", "5")),
+        help="Stop a sweep after this many consecutive RealPage HTTP 401 responses. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--auto-refresh-auth",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("AUTO_REFRESH_AUTH", True),
+    )
+    parser.add_argument("--auth-refresh-url", default=os.getenv("AUTH_REFRESH_URL", DEFAULT_AUTH_REFRESH_URL))
+    parser.add_argument(
+        "--auth-refresh-browser",
+        default=os.getenv("AUTH_REFRESH_BROWSER", "auto"),
+        help="Browser used for auth refresh: auto, webkit, chromium, or firefox.",
+    )
+    parser.add_argument(
+        "--auth-refresh-timeout-seconds",
+        type=float,
+        default=float(os.getenv("AUTH_REFRESH_TIMEOUT_SECONDS", "45")),
+    )
     parser.add_argument("--notify-on-first-run", action="store_true", default=env_bool("NOTIFY_ON_FIRST_RUN", False))
     parser.add_argument("--alert-on-errors", action="store_true", default=env_bool("ALERT_ON_ERRORS", True))
     parser.add_argument("--once", action="store_true", default=env_bool("RUN_ONCE", False))
@@ -595,6 +896,11 @@ def build_config(argv: list[str]) -> Config:
         raise ValueError("--request-delay-seconds cannot be negative")
     if args.timeout_seconds <= 0:
         raise ValueError("--timeout-seconds must be greater than zero")
+    if args.max_consecutive_401 < 0:
+        raise ValueError("--max-consecutive-401 cannot be negative")
+    if args.auth_refresh_timeout_seconds <= 0:
+        raise ValueError("--auth-refresh-timeout-seconds must be greater than zero")
+    refresh_browser_order(args.auth_refresh_browser)
 
     client_session_id = args.client_session_id
     if client_session_id.strip().lower() == "auto":
@@ -612,6 +918,11 @@ def build_config(argv: list[str]) -> Config:
         client_session_id=client_session_id,
         xyz_header=args.xyz_header,
         user_agent=args.user_agent,
+        max_consecutive_401=args.max_consecutive_401,
+        auto_refresh_auth=args.auto_refresh_auth,
+        auth_refresh_url=args.auth_refresh_url,
+        auth_refresh_browser=args.auth_refresh_browser,
+        auth_refresh_timeout_seconds=args.auth_refresh_timeout_seconds,
         notify_on_first_run=args.notify_on_first_run,
         alert_on_errors=args.alert_on_errors,
         once=args.once,
@@ -637,12 +948,23 @@ def main(argv: list[str]) -> int:
         flush=True,
     )
     print(f"RealPage ClientSessionID={config.client_session_id}", flush=True)
+    if config.auto_refresh_auth:
+        print(
+            "RealPage auth auto-refresh enabled; "
+            f"browser={config.auth_refresh_browser}; page={config.auth_refresh_url}",
+            flush=True,
+        )
 
     while not stop:
         started = time.monotonic()
         try:
             changed_dates = poll_once(config, state)
             print(f"Sweep complete: {changed_dates} date(s) changed.", flush=True)
+        except AuthRefreshed as exc:
+            print(exc, flush=True)
+            if config.once:
+                break
+            continue
         except Exception as exc:
             message = f"Availability bot error: {exc}"
             print(message, file=sys.stderr, flush=True)
